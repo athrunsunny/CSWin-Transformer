@@ -89,38 +89,38 @@ class LePEAttention(nn.Module):
         B, N, C = x.shape
         H = W = int(np.sqrt(N))
         x = x.transpose(-2,-1).contiguous().view(B, C, H, W) # [B, N, C] -> [B, C, N] -> [B, C, H, W]
-        x = img2windows(x, self.H_sp, self.W_sp) # [N*56 56 32]
-        x = x.reshape(-1, self.H_sp* self.W_sp, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3).contiguous() # [N*56 1 56 32]
+        x = img2windows(x, self.H_sp, self.W_sp) # [N*56*1 56 32] [N*14*1 56 64] [N*2*1 98 128] [N*1*1 49 512]
+        x = x.reshape(-1, self.H_sp* self.W_sp, self.num_heads, C // self.num_heads).permute(0, 2, 1, 3).contiguous() # [N*56*1 1 56 32] [N*14*1 2 56 32] [N*2*1 4 98 32] [N*1*1 16 49 32]
         return x
 
     def get_lepe(self, x, func):
-        B, N, C = x.shape # [N 3136 32]
+        B, N, C = x.shape # [N 3136 32] [N 784 64] [N 196 128] [N 49 512]
         H = W = int(np.sqrt(N))
-        x = x.transpose(-2,-1).contiguous().view(B, C, H, W) # [N 32 56 56]
+        x = x.transpose(-2,-1).contiguous().view(B, C, H, W) # [N 32 56 56] [N 64 28 28] [N 128 14 14] [N 512 7 7]
 
         H_sp, W_sp = self.H_sp, self.W_sp
-        x = x.view(B, C, H // H_sp, H_sp, W // W_sp, W_sp) # [N 32 1 56 56 1] # 先竖列[1 56]
-        x = x.permute(0, 2, 4, 1, 3, 5).contiguous().reshape(-1, C, H_sp, W_sp) ### B', C, H', W' # [N*56 32 56 1]
+        x = x.view(B, C, H // H_sp, H_sp, W // W_sp, W_sp) # [N 32 1 56 56 1] [N 32 56 1 1 56] / [N 64 1 28 14 2] [N 64 14 2 1 28] / [N 128 1 14 2 7] [N 128 2 7 1 14] / [N 512 1 7 1 7]
+        x = x.permute(0, 2, 4, 1, 3, 5).contiguous().reshape(-1, C, H_sp, W_sp) ### B', C, H', W' # [N*56*1 32 56 1][N*56*1 32 1 56] / [N*14*1 64 28 2][N*14*1 64 2 28] / [N*2*1 128 14 7][N*2*1 128 7 14] / [N*1*1 512 7 7]
 
-        lepe = func(x) ### B', C, H', W' # [N*56 32 56 1]
-        lepe = lepe.reshape(-1, self.num_heads, C // self.num_heads, H_sp * W_sp).permute(0, 1, 3, 2).contiguous() # [N*56 1 56 32]
+        lepe = func(x) ### B', C, H', W' # [N*56*1 32 56 1] [N*56*1 32 1 56] / [N*14*1 64 28 2][N*14*1 64 2 28] / [N*2*1 128 14 7][N*2*1 128 7 14]  / [N*1*1 512 7 7]
+        lepe = lepe.reshape(-1, self.num_heads, C // self.num_heads, H_sp * W_sp).permute(0, 1, 3, 2).contiguous() # [N*56*1 1 56 32] [N*14*1 2 56 32] [N*2*1 4 98 32] [N*1*1 16 49 32]
 
-        x = x.reshape(-1, self.num_heads, C // self.num_heads, self.H_sp* self.W_sp).permute(0, 1, 3, 2).contiguous() # [N*56 1 56 32]
+        x = x.reshape(-1, self.num_heads, C // self.num_heads, self.H_sp* self.W_sp).permute(0, 1, 3, 2).contiguous() # [N*56*1 1 56 32] [N*14*1 2 56 32] [N*2*1 4 98 32] [N*1*1 16 49 32]
         return x, lepe
 
     def forward(self, qkv):
         """
         x: B L C
         """
-        q,k,v = qkv[0], qkv[1], qkv[2] # [N 3136 32]
+        q,k,v = qkv[0], qkv[1], qkv[2] # [N 3136 32] [N 784 64] [N 196 128] [N 49 512]
 
         ### Img2Window
-        H = W = self.resolution # 56
-        B, L, C = q.shape # [N 3136 32]
+        H = W = self.resolution # 56 28 14 7
+        B, L, C = q.shape # [N 3136 32] [N 784 64] [N 196 128] [N 49 512]
         assert L == H * W, "flatten img_tokens has wrong size"
         
-        q = self.im2cswin(q) # [N*56 1 56 32]
-        k = self.im2cswin(k) # [N*56 1 56 32]
+        q = self.im2cswin(q) # [N*56*1 1 56 32] [N*14*1 2 56 32] [N*2*1 4 98 32] [N*1*1 16 49 32]
+        k = self.im2cswin(k) # [N*56*1 1 56 32] [N*14*1 2 56 32] [N*2*1 4 98 32] [N*1*1 16 49 32]
         v, lepe = self.get_lepe(v, self.get_v)
 
         q = q * self.scale
@@ -129,12 +129,12 @@ class LePEAttention(nn.Module):
         attn = self.attn_drop(attn)
 
         x = (attn @ v) + lepe
-        x = x.transpose(1, 2).reshape(-1, self.H_sp* self.W_sp, C)  # B head N N @ B head N C # [N*56 56 32]
+        x = x.transpose(1, 2).reshape(-1, self.H_sp* self.W_sp, C)  # B head N N @ B head N C # [N*56*1 56 32] [N*14*1 56 64] [N*2*1 98 128] [N*1*1 49 512]
 
         ### Window2Img
         x = windows2img(x, self.H_sp, self.W_sp, H, W).view(B, -1, C)  # B H' W' C
 
-        return x # [N 3136 32]
+        return x # [N 3136 32] [N 784 64] [N 196 128] [N 49 512]
 
 
 class CSWinBlock(nn.Module):
@@ -190,14 +190,14 @@ class CSWinBlock(nn.Module):
         """
 
         H = W = self.patches_resolution # 56
-        B, L, C = x.shape # [N 3136 64]
+        B, L, C = x.shape # [N 3136 64] [N 784 128] [N 196 256] [N 49 512]
         assert L == H * W, "flatten img_tokens has wrong size"
         img = self.norm1(x)
-        qkv = self.qkv(img).reshape(B, -1, 3, C).permute(2, 0, 1, 3) # [3 N 3136 64]
+        qkv = self.qkv(img).reshape(B, -1, 3, C).permute(2, 0, 1, 3) # [3 N 3136 64] [3 N 784 128] [3 N 196 256] [3 N 49 512]
         
         if self.branch_num == 2:
-            x1 = self.attns[0](qkv[:,:,:,:C//2]) # [3 N 3136 32]->[N 3136 32]
-            x2 = self.attns[1](qkv[:,:,:,C//2:]) # [3 N 3136 32]->[N 3136 32]
+            x1 = self.attns[0](qkv[:,:,:,:C//2]) # qkv[3 N 3136 32]->x1[N 3136 32] qkv[3 N 784 128]->x1[N 784 64] qkv[3 N 196 256]->x1[N 196 128]
+            x2 = self.attns[1](qkv[:,:,:,C//2:]) # qkv[3 N 3136 32]->x2[N 3136 32] qkv[3 N 784 128]->x1[N 784 64] qkv[3 N 196 256]->x1[N 196 128]
             attened_x = torch.cat([x1,x2], dim=2)
         else:
             attened_x = self.attns[0](qkv)
@@ -205,15 +205,15 @@ class CSWinBlock(nn.Module):
         x = x + self.drop_path(attened_x)
         x = x + self.drop_path(self.mlp(self.norm2(x)))
 
-        return x
+        return x # [N 3136 64] [N 784 128] [N 196 256] [N 49 512]
 
 def img2windows(img, H_sp, W_sp):
     """
     img: B C H W
     """
     B, C, H, W = img.shape
-    img_reshape = img.view(B, C, H // H_sp, H_sp, W // W_sp, W_sp) # [N 32 1 56 56 1]
-    img_perm = img_reshape.permute(0, 2, 4, 3, 5, 1).contiguous().reshape(-1, H_sp* W_sp, C) # [N*56 56 32]
+    img_reshape = img.view(B, C, H // H_sp, H_sp, W // W_sp, W_sp) # [N 32 1 56 56 1] [N 32 56 1 1 56] / [N 64 1 28 14 2] [N 64 14 2 1 28] / [N 128 1 14 2 7] [N 128 2 7 1 14] / [N 512 1 7 1 7]
+    img_perm = img_reshape.permute(0, 2, 4, 3, 5, 1).contiguous().reshape(-1, H_sp* W_sp, C) # [N*56*1 56 32] [N*56*1 56 32] / [N*14*1 56 64] [N*14*1 56 64] / [N*2*1 98 128] [N*2*1 98 128] / [N*1*1 49 512]
     return img_perm
 
 def windows2img(img_splits_hw, H_sp, W_sp, H, W):
@@ -222,8 +222,8 @@ def windows2img(img_splits_hw, H_sp, W_sp, H, W):
     """
     B = int(img_splits_hw.shape[0] / (H * W / H_sp / W_sp))
 
-    img = img_splits_hw.view(B, H // H_sp, W // W_sp, H_sp, W_sp, -1) # [N*56 56 32]->[N 1 56 56 1 32]
-    img = img.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, -1) # [N 56 56 32]
+    img = img_splits_hw.view(B, H // H_sp, W // W_sp, H_sp, W_sp, -1) # [N*56*1 56 32]->[N 1 56 56 1 32] [N*56*1 56 32]->[N 56 1 1 56 32] / [N*14*1 56 64]->[N 1 14 28 2 64] [N*14*1 56 64]->[N 14 1 2 28 64] / [N*2*1 98 128]->[N 1 2 14 7 128] [N*2*1 98 128]->[N 2 1 7 14 128] / [N*1*1 49 512]->[N 1 1 7 7 512]
+    img = img.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, -1) # [N 56 56 32] [N 28 28 64] [N 14 14 128] [N 7 7 512]
     return img
 
 class Merge_Block(nn.Module):
@@ -346,7 +346,7 @@ class CSWinTransformer(nn.Module):
                 x = blk(x)
         for pre, blocks in zip([self.merge1, self.merge2, self.merge3], 
                                [self.stage2, self.stage3, self.stage4]):
-            x = pre(x)
+            x = pre(x) # [N 784 128] [N 196 256] [N 49 512]
             for blk in blocks:
                 if self.use_chk:
                     x = checkpoint.checkpoint(blk, x)
@@ -356,7 +356,7 @@ class CSWinTransformer(nn.Module):
         return torch.mean(x, dim=1)
 
     def forward(self, x):
-        x = self.forward_features(x) # [N 3 224 224]
+        x = self.forward_features(x)
         x = self.head(x)
         return x
 
